@@ -48,6 +48,7 @@ file-mode         return FILE_MODE;
 save-previous     return SAVE_PREVIOUS;
 save-linked       return SAVE_LINKED;
 disable-genhomedircon return DISABLE_GENHOMEDIRCON;
+enable-genhomedircon-rbac return ENABLE_GENHOMEDIRCON_RBAC;
 usepasswd return USEPASSWD;
 ignoredirs        return IGNOREDIRS;
 handle-unknown    return HANDLE_UNKNOWN;

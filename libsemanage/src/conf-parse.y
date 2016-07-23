@@ -65,6 +65,7 @@ static int parse_errors;
 %token VERIFY_MOD_START VERIFY_LINKED_START VERIFY_KERNEL_START BLOCK_END
 %token PROG_PATH PROG_ARGS
 %token <s> ARG
+%token ENABLE_GENHOMEDIRCON_RBAC
 %type <d> verify_start_tok
 
 %%
@@ -89,6 +90,7 @@ single_opt:     module_store
         |       save_previous
         |       save_linked
         |       disable_genhomedircon
+        |       enable_genhomedircon_rbac
         |       usepasswd
         |       ignoredirs
         |       handle_unknown
@@ -207,6 +209,18 @@ disable_genhomedircon: DISABLE_GENHOMEDIRCON '=' ARG {
 	}
 	free($3);
  }
+
+enable_genhomedircon_rbac: ENABLE_GENHOMEDIRCON_RBAC '=' ARG {
+	if (strcasecmp($3, "false") == 0) {
+		current_conf->enable_genhomedircon_rbac = 0;
+	} else if (strcasecmp($3, "true") == 0) {
+		current_conf->enable_genhomedircon_rbac = 1;
+	} else {
+		yyerror("enable-genhomedircon-rbac can only be 'true' or 'false'");
+	}
+	free($3);
+ }
+
 
 usepasswd: USEPASSWD '=' ARG {
 	if (strcasecmp($3, "false") == 0) {

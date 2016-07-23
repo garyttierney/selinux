@@ -20,34 +20,38 @@
  *  02110-1301  USA
  */
 
-#include <semanage/handle.h>
-#include <semanage/seusers_policy.h>
-#include <semanage/users_policy.h>
-#include <semanage/user_record.h>
-#include <semanage/fcontext_record.h>
-#include <semanage/fcontexts_policy.h>
-#include <sepol/context.h>
-#include <sepol/context_record.h>
+#include "debug.h"
 #include "semanage_store.h"
 #include "seuser_internal.h"
-#include "debug.h"
+#include <selinux/context.h>
+#include <semanage/fcontext_record.h>
+#include <semanage/fcontexts_policy.h>
+#include <semanage/handle.h>
+#include <semanage/seusers_policy.h>
+#include <semanage/user_record.h>
+#include <semanage/users_policy.h>
+#include <sepol/context.h>
+#include <sepol/context_record.h>
 
-#include "utilities.h"
 #include "genhomedircon.h"
+#include "utilities.h"
 #include <ustr.h>
 
 #include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <grp.h>
 #include <limits.h>
+#include <math.h>
+#include <pwd.h>
+#include <regex.h>
+#include <search.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
-#include <pwd.h>
-#include <errno.h>
+#include <sys/types.h>
 #include <unistd.h>
-#include <regex.h>
 
 /* paths used in get_home_dirs() */
 #define PATH_ETC_USERADD "/etc/default/useradd"
@@ -61,13 +65,17 @@
 #define PATH_NOLOGIN_SHELL "/sbin/nologin"
 
 /* comments written to context file */
-#define COMMENT_FILE_CONTEXT_HEADER "#\n#\n# " \
-			"User-specific file contexts, generated via libsemanage\n" \
-			"# use semanage command to manage system users to change" \
-			" the file_context\n#\n#\n"
+#define COMMENT_FILE_CONTEXT_HEADER                                            \
+	"#\n#\n# "                                                             \
+	"User-specific file contexts, generated via libsemanage\n"             \
+	"# use semanage command to manage system users to change"              \
+	" the file_context\n#\n#\n"
 
-#define COMMENT_USER_HOME_CONTEXT "\n\n#\n# Home Context for user %s" \
-			"\n#\n\n"
+#define COMMENT_USER_HOME_CONTEXT                                              \
+	"\n\n#\n# Home Context for user %s"                                    \
+	"\n#\n\n"
+
+#define CONTEXT_NONE "<<none>>"
 
 /* placeholders used in the template file
    which are searched for and replaced */
@@ -76,430 +84,601 @@
 /* these are legacy */
 #define TEMPLATE_USER "USER"
 #define TEMPLATE_ROLE "ROLE"
+
 /* new names */
 #define TEMPLATE_USERNAME "%{USERNAME}"
 #define TEMPLATE_USERID "%{USERID}"
 
-#define TEMPLATE_SEUSER "system_u"
-#define TEMPLATE_LEVEL "s0"
-
-#define FALLBACK_SENAME "user_u"
-#define FALLBACK_PREFIX "user"
-#define FALLBACK_LEVEL "s0"
 #define FALLBACK_NAME "[^/]+"
 #define FALLBACK_UIDGID "[0-9]+"
 #define DEFAULT_LOGIN "__default__"
 
-typedef struct user_entry {
-	char *name;
-	char *uid;
-	char *gid;
-	char *sename;
-	char *prefix;
-	char *home;
-	char *level;
-	struct user_entry *next;
-} genhomedircon_user_entry_t;
-
-typedef struct {
-	const char *fcfilepath;
-	int usepasswd;
-	const char *homedir_template_path;
-	genhomedircon_user_entry_t *fallback;
-	semanage_handle_t *h_semanage;
-	sepol_policydb_t *policydb;
-} genhomedircon_settings_t;
-
-typedef struct {
+struct replacement_pair {
 	const char *search_for;
 	const char *replace_with;
-} replacement_pair_t;
+};
 
-typedef struct {
-	const char *dir;
-	int matched;
-} fc_match_handle_t;
+/*
+ Represents a mapping of a Linux login
+ to a SELinux user (not necessarily a 1-1
+ mapping with seusers since groups are expanded)
+*/
+struct selogin_list {
+	char *name;
+	char *sename;
+	char *level;
+	char *prefix;
 
-typedef struct IgnoreDir {
-	struct IgnoreDir *next;
-	char *dir;
-} ignoredir_t;
+	char *uid;
+	char *gid;
+	char *homedir;
 
-ignoredir_t *ignore_head = NULL;
+	struct selogin_list *next;
+};
 
-static void ignore_free(void) {
-	ignoredir_t *next;
+static int strcomparator(const void *a, const void *b) { return strcmp(a, b); }
 
-	while (ignore_head) {
-		next = ignore_head->next;
-		free(ignore_head->dir);
-		free(ignore_head);
-		ignore_head = next;
-	}
-}
-
-static int ignore_setup(char *ignoredirs) {
-	char *tok;
-	ignoredir_t *ptr = NULL; 
-
-	tok = strtok(ignoredirs, ";");
-	while(tok) {
-		ptr = calloc(sizeof(ignoredir_t),1);
-		if (!ptr)
-			goto err;
-		ptr->dir = strdup(tok);
-		if (!ptr->dir)
-			goto err;
-
-		ptr->next = ignore_head;
-		ignore_head = ptr;
-
-		tok = strtok(NULL, ";");
-	}
-
-	return 0;
-err:
-	free(ptr);
-	ignore_free();
-	return -1;
-}
-
-static int ignore(const char *homedir) {
-	ignoredir_t *ptr = ignore_head;
-	while (ptr) {
-		if (strcmp(ptr->dir, homedir) == 0) {
-			return 1;
-		}
-		ptr = ptr->next;
-	}
-	return 0;
-}
-
-static semanage_list_t *default_shell_list(void)
-{
-	semanage_list_t *list = NULL;
-
-	if (semanage_list_push(&list, "/bin/csh")
-	    || semanage_list_push(&list, "/bin/tcsh")
-	    || semanage_list_push(&list, "/bin/ksh")
-	    || semanage_list_push(&list, "/bin/bsh")
-	    || semanage_list_push(&list, "/bin/ash")
-	    || semanage_list_push(&list, "/usr/bin/ksh")
-	    || semanage_list_push(&list, "/usr/bin/pdksh")
-	    || semanage_list_push(&list, "/bin/zsh")
-	    || semanage_list_push(&list, "/bin/sh")
-	    || semanage_list_push(&list, "/bin/bash"))
-		goto fail;
-
-	return list;
-
-      fail:
-	semanage_list_destroy(&list);
-	return NULL;
-}
-
-static semanage_list_t *get_shell_list(void)
-{
-	FILE *shells;
-	char *temp = NULL;
-	semanage_list_t *list = NULL;
-	size_t buff_len = 0;
-	ssize_t len;
-
-	shells = fopen(PATH_SHELLS_FILE, "r");
-	if (!shells)
-		return default_shell_list();
-	while ((len = getline(&temp, &buff_len, shells)) > 0) {
-		if (temp[len-1] == '\n') temp[len-1] = 0;
-		if (strcmp(temp, PATH_NOLOGIN_SHELL)) {
-			if (semanage_list_push(&list, temp)) {
-				free(temp);
-				semanage_list_destroy(&list);
-				return default_shell_list();
-			}
-		}
-	}
-	free(temp);
-
-	return list;
-}
-
-/* Helper function called via semanage_fcontext_iterate() */
-static int fcontext_matches(const semanage_fcontext_t *fcontext, void *varg)
-{
-	const char *oexpr = semanage_fcontext_get_expr(fcontext);
-	fc_match_handle_t *handp = varg;
-	struct Ustr *expr;
-	regex_t re;
-	int type, retval = -1;
-
-	/* Only match ALL or DIR */
-	type = semanage_fcontext_get_type(fcontext);
-	if (type != SEMANAGE_FCONTEXT_ALL && type != SEMANAGE_FCONTEXT_ALL)
-		return 0;
-
-	/* Convert oexpr into a Ustr and anchor it at the beginning */
-	expr = ustr_dup_cstr("^");
-	if (expr == USTR_NULL)
-		goto done;
-	if (!ustr_add_cstr(&expr, oexpr))
-		goto done;
-
-	/* Strip off trailing ".+" or ".*" */
-	if (ustr_cmp_suffix_cstr_eq(expr, ".+") ||
-	    ustr_cmp_suffix_cstr_eq(expr, ".*")) {
-		if (!ustr_del(&expr, 2))
-			goto done;
-	}
-
-	/* Strip off trailing "(/.*)?" */
-	if (ustr_cmp_suffix_cstr_eq(expr, "(/.*)?")) {
-		if (!ustr_del(&expr, 6))
-			goto done;
-	}
-
-	if (ustr_cmp_suffix_cstr_eq(expr, "/")) {
-		if (!ustr_del(&expr, 1))
-			goto done;
-	}
-
-	/* Append pattern to eat up trailing slashes */
-	if (!ustr_add_cstr(&expr, "/*$"))
-		goto done;
-
-	/* Check dir against expr */
-	if (regcomp(&re, ustr_cstr(expr), REG_EXTENDED) != 0)
-		goto done;
-	if (regexec(&re, handp->dir, 0, NULL, 0) == 0)
-		handp->matched = 1;
-	regfree(&re);
-
-	retval = 0;
-
-done:
-	ustr_free(expr);
-
-	return retval;
-}
-
-static semanage_list_t *get_home_dirs(genhomedircon_settings_t * s)
-{
-	semanage_list_t *homedir_list = NULL;
-	semanage_list_t *shells = NULL;
-	fc_match_handle_t hand;
-	char *rbuf = NULL;
-	char *path = NULL;
-	long rbuflen;
-	uid_t temp, minuid = 500, maxuid = 60000;
-	int minuid_set = 0;
-	struct passwd pwstorage, *pwbuf;
-	struct stat buf;
-	int retval;
-
-	path = semanage_findval(PATH_ETC_USERADD, "HOME", "=");
-	if (path && *path) {
-		if (semanage_list_push(&homedir_list, path))
-			goto fail;
-	}
-	free(path);
-
-	path = semanage_findval(PATH_ETC_LIBUSER, "LU_HOMEDIRECTORY", "=");
-	if (path && *path) {
-		if (semanage_list_push(&homedir_list, path))
-			goto fail;
-	}
-	free(path);
-	path = NULL;
-
-	if (!homedir_list) {
-		if (semanage_list_push(&homedir_list, PATH_DEFAULT_HOME)) {
-			goto fail;
-		}
-	}
-
-	if (!stat(PATH_EXPORT_HOME, &buf)) {
-		if (S_ISDIR(buf.st_mode)) {
-			if (semanage_list_push(&homedir_list, PATH_EXPORT_HOME)) {
-				goto fail;
-			}
-		}
-	}
-
-	if (!(s->usepasswd))
-		return homedir_list;
-
-	shells = get_shell_list();
-	assert(shells);
-
-	path = semanage_findval(PATH_ETC_LOGIN_DEFS, "UID_MIN", NULL);
-	if (path && *path) {
-		temp = atoi(path);
-		minuid = temp;
-		minuid_set = 1;
-	}
-	free(path);
-	path = NULL;
-
-	path = semanage_findval(PATH_ETC_LOGIN_DEFS, "UID_MAX", NULL);
-	if (path && *path) {
-		temp = atoi(path);
-		maxuid = temp;
-	}
-	free(path);
-	path = NULL;
-
-	path = semanage_findval(PATH_ETC_LIBUSER, "LU_UIDNUMBER", "=");
-	if (path && *path) {
-		temp = atoi(path);
-		if (!minuid_set || temp < minuid) {
-			minuid = temp;
-			minuid_set = 1;
-		}
-	}
-	free(path);
-	path = NULL;
-
-	rbuflen = sysconf(_SC_GETPW_R_SIZE_MAX);
-	if (rbuflen <= 0)
-		goto fail;
-	rbuf = malloc(rbuflen);
-	if (rbuf == NULL)
-		goto fail;
-	setpwent();
-	while ((retval = getpwent_r(&pwstorage, rbuf, rbuflen, &pwbuf)) == 0) {
-		if (pwbuf->pw_uid < minuid || pwbuf->pw_uid > maxuid)
-			continue;
-		if (!semanage_list_find(shells, pwbuf->pw_shell))
-			continue;
-		int len = strlen(pwbuf->pw_dir) -1;
-		for(; len > 0 && pwbuf->pw_dir[len] == '/'; len--) {
-			pwbuf->pw_dir[len] = '\0';
-		}
-		if (strcmp(pwbuf->pw_dir, "/") == 0)
-			continue;
-		if (ignore(pwbuf->pw_dir))
-			continue;
-		if (semanage_str_count(pwbuf->pw_dir, '/') <= 1)
-			continue;
-		if (!(path = strdup(pwbuf->pw_dir))) {
-			break;
-		}
-
-		semanage_rtrim(path, '/');
-
-		if (!semanage_list_find(homedir_list, path)) {
-			/*
-			 * Now check for an existing file context that matches
-			 * so we don't label a non-homedir as a homedir.
-			 */
-			hand.dir = path;
-			hand.matched = 0;
-			if (semanage_fcontext_iterate(s->h_semanage,
-			    fcontext_matches, &hand) == STATUS_ERR)
-				goto fail;
-
-			/* NOTE: old genhomedircon printed a warning on match */
-			if (hand.matched) {
-				WARN(s->h_semanage, "%s homedir %s or its parent directory conflicts with a file context already specified in the policy.  This usually indicates an incorrectly defined system account.  If it is a system account please make sure its uid is less than %u or greater than %u or its login shell is /sbin/nologin.", pwbuf->pw_name, pwbuf->pw_dir, minuid, maxuid);
-			} else {
-				if (semanage_list_push(&homedir_list, path))
-					goto fail;
-			}
-		}
-		free(path);
-		path = NULL;
-	}
-
-	if (retval && retval != ENOENT) {
-		WARN(s->h_semanage, "Error while fetching users.  "
-		     "Returning list so far.");
-	}
-
-	if (semanage_list_sort(&homedir_list))
-		goto fail;
-
-	endpwent();
-	free(rbuf);
-	semanage_list_destroy(&shells);
-
-	return homedir_list;
-
-      fail:
-	endpwent();
-	free(rbuf);
-	free(path);
-	semanage_list_destroy(&homedir_list);
-	semanage_list_destroy(&shells);
-	return NULL;
-}
-
-/**
- * @param	out	the FILE to put all the output in.
- * @return	0 on success
+/*
+  Predicate for file context specifications which
+  are to be written for each home directory root
+  (e.g., /home).
  */
-static int write_file_context_header(FILE * out)
+static int ROOT_PRED(const char *string)
 {
-	if (fprintf(out, COMMENT_FILE_CONTEXT_HEADER) < 0) {
+	return semanage_is_prefix(string, TEMPLATE_HOME_ROOT);
+}
+
+/*
+  Predicate for file context specifications which
+  are to be written for each home directory.
+ */
+static int HOMEDIR_PRED(const char *string)
+{
+	return semanage_is_prefix(string, TEMPLATE_HOME_DIR);
+}
+
+/*
+  Predicate for file context specifications which
+  are to be written once per SELinux login.
+ */
+static int USER_PRED(const char *string)
+{
+	return strstr(string, TEMPLATE_USER) != NULL ||
+	       strstr(string, TEMPLATE_USERNAME) != NULL ||
+	       strstr(string, TEMPLATE_USERID) != NULL;
+}
+
+static int genhomedircon_get_home_dirs(semanage_list_t **out, int usepasswd)
+{
+	(void) usepasswd;
+	// @todo - pull the relevant parts of code back into the original
+	// genhomedircon to avoid re-implementing parts like this
+
+	if (semanage_list_push(out, PATH_DEFAULT_HOME) != STATUS_SUCCESS) {
 		return STATUS_ERR;
 	}
 
 	return STATUS_SUCCESS;
 }
 
-/* Predicates for use with semanage_slurp_file_filter() the homedir_template
- * file currently contains lines that serve as the template for a user's
- * homedir.
- *
- * It also contains lines that are the template for the parent of a
- * user's home directory.
- *
- * Currently, the only lines that apply to the the root of a user's home
- * directory are all prefixed with the string "HOME_ROOT".  All other
- * lines apply to a user's home directory.  If this changes the
- * following predicates need to change to reflect that.
- */
-static int HOME_ROOT_PRED(const char *string)
+static struct selogin_list *genhomedircon_user_free(struct selogin_list *user)
 {
-	return semanage_is_prefix(string, TEMPLATE_HOME_ROOT);
+	struct selogin_list *next = user->next;
+
+	free(user->name);
+	free(user->sename);
+	free(user->prefix);
+	free(user->uid);
+	free(user->gid);
+	free(user->level);
+	free(user->homedir);
+	free(user);
+
+	return next;
 }
 
-static int HOME_DIR_PRED(const char *string)
+static int genhomedircon_user_find(struct selogin_list *list, const char *name)
 {
-	return semanage_is_prefix(string, TEMPLATE_HOME_DIR);
+	struct selogin_list *curr = list;
+
+	while (curr != NULL) {
+		if (strcmp(curr->name, name) == 0) {
+			return 1;
+		}
+
+		curr = curr->next;
+	}
+
+	return 0;
 }
 
-/* new names */
-static int USERNAME_CONTEXT_PRED(const char *string)
+static int genhomedircon_user_read_pwent(struct selogin_list *user,
+					 const char *name)
 {
-	return (int)(
-		(strstr(string, TEMPLATE_USERNAME) != NULL) ||
-		(strstr(string, TEMPLATE_USERID) != NULL)
-	);
+	int retval = STATUS_ERR;
+	struct passwd *pwent = getpwnam(name);
+
+	if (pwent == NULL) {
+		return -ENOENT;
+	}
+
+	if (!pwent->pw_dir) {
+		return -ENOENT;
+	}
+
+	int len = -1;
+	int expected_len = -1;
+	char *uid = NULL;
+	char *gid = NULL;
+
+	expected_len = sizeof(char) * (log10(pwent->pw_uid) + 2);
+	uid = malloc(expected_len);
+	if (!uid) {
+		goto done;
+	}
+
+	len = snprintf(uid, expected_len, "%u", pwent->pw_uid);
+
+	if (len < 0 || len > expected_len) {
+		goto done;
+	}
+
+	expected_len = sizeof(char) * (log10(pwent->pw_gid) + 2);
+	gid = malloc(expected_len);
+	if (!gid) {
+		goto done;
+	}
+
+	len = snprintf(gid, expected_len, "%u", pwent->pw_gid);
+
+	if (len < 0 || len > expected_len) {
+		goto done;
+	}
+
+	user->uid = uid;
+	user->gid = gid;
+	user->homedir = strdup(pwent->pw_dir);
+
+	if (!user->homedir) {
+		goto done;
+	}
+
+	retval = STATUS_SUCCESS;
+done:
+	if (retval < 0) {
+		free(user->uid);
+		free(user->gid);
+		free(user->homedir);
+		user->uid = NULL;
+		user->gid = NULL;
+		user->homedir = NULL;
+	}
+
+	return retval;
 }
 
-/* This will never match USER if USERNAME or USERID are found. */
-static int USER_CONTEXT_PRED(const char *string)
+static int genhomedircon_user_add(semanage_handle_t *sh,
+				  struct selogin_list **entry_list,
+				  const char *name, const char *sename,
+				  int is_default_login)
 {
-	if (USERNAME_CONTEXT_PRED(string))
-		return 0;
+	int retval = STATUS_ERR;
 
-	return (int)(strstr(string, TEMPLATE_USER) != NULL);
+	struct selogin_list *user = NULL;
+	semanage_user_key_t *key = NULL;
+	semanage_user_t *seuser = NULL;
+
+	if (genhomedircon_user_find(*entry_list, name)) {
+		ERR(sh, "Found more than 1 entry for %s", name);
+		goto done;
+	}
+
+	user = calloc(1, sizeof *user);
+	if (!user) {
+		goto done;
+	}
+
+	if (semanage_user_key_create(sh, sename, &key) < 0) {
+		goto done;
+	}
+
+	if (semanage_user_query(sh, key, &seuser) < 0) {
+		ERR(sh, "No SELinux user found named \"%s\"", sename);
+		goto done;
+	}
+
+	const char *prefix = semanage_user_get_prefix(seuser);
+	if (prefix) {
+		user->prefix = strdup(prefix);
+	} else {
+		user->prefix = strdup(name);
+	}
+
+	if (!user->prefix) {
+		goto done;
+	}
+
+	const char *level = semanage_user_get_mlslevel(seuser);
+	if (!level) {
+		goto done;
+	}
+
+	user->sename = strdup(sename);
+	user->level = strdup(level);
+
+	if (!user->sename || !user->level) {
+		goto done;
+	}
+
+	if (!is_default_login) {
+		user->name = strdup(name);
+
+		if (!user->name) {
+			goto done;
+		}
+
+		retval = genhomedircon_user_read_pwent(user, name);
+		if (retval < 0) {
+			goto done;
+		}
+	}
+
+	user->next = *entry_list;
+	*entry_list = user;
+
+	retval = STATUS_SUCCESS;
+done:
+	if (retval < 0 && user) {
+		genhomedircon_user_free(user);
+	}
+
+	semanage_user_key_free(key);
+	semanage_user_free(seuser);
+
+	return retval;
 }
 
-/* make_tempate
- * @param	s	  the settings holding the paths to various files
- * @param	pred	function pointer to function to use as filter for slurp
- * 					file filter
- * @return   a list of lines from the template file with inappropriate
- *	    lines filtered out.
- */
-static semanage_list_t *make_template(genhomedircon_settings_t * s,
-				      int (*pred) (const char *))
+static int genhomedircon_get_group_users(semanage_handle_t *sh,
+					 struct selogin_list **entry_list,
+					 const char *name, const char *sename)
+{
+	int retval = STATUS_ERR;
+	struct group *group = getgrnam(name);
+
+	if (group == NULL) {
+		ERR(sh, "Can't find group named %s\n", name);
+		goto exit;
+	}
+
+	size_t nmembers = 0;
+	char **members = group->gr_mem;
+
+	while (*members != NULL) {
+		nmembers++;
+		members++;
+	}
+
+	for (unsigned int i = 0; i < nmembers; i++) {
+		const char *uname = group->gr_mem[i];
+
+		if (genhomedircon_user_add(sh, entry_list, uname, sename, 0) ==
+		    STATUS_ERR) {
+			return STATUS_ERR;
+		}
+	}
+
+	setpwent();
+
+	struct passwd *pwent = NULL;
+	while ((pwent = getpwent()) != NULL) {
+		// skip users who also have this group as their
+		// primary group
+		if (lfind(pwent->pw_name, group->gr_mem, &nmembers,
+			  sizeof(char *), strcomparator)) {
+			continue;
+		}
+
+		if (group->gr_gid == pwent->pw_gid) {
+			if (genhomedircon_user_add(
+				sh, entry_list, pwent->pw_name, sename, 0)) {
+				goto exit;
+			}
+		}
+	}
+
+	retval = STATUS_SUCCESS;
+exit:
+	endpwent();
+	return retval;
+}
+
+static int genhomedircon_get_users(semanage_handle_t *sh,
+				   struct selogin_list **login_list,
+				   struct selogin_list **default_login)
+{
+	int retval = STATUS_ERR;
+
+	semanage_seuser_t **seusers = NULL;
+	unsigned int nseusers;
+
+	retval = semanage_seuser_list(sh, &seusers, &nseusers);
+	if (retval < 0) {
+		goto clean;
+	}
+
+	unsigned int i;
+	for (i = 0; i < nseusers; i++) {
+		const char *name = semanage_seuser_get_name(seusers[i]);
+		const char *sename = semanage_seuser_get_sename(seusers[i]);
+
+		if (name[0] == '%') {
+			retval = genhomedircon_get_group_users(
+			    sh, login_list, name + 1, sename);
+		} else {
+			if (strcmp(name, "root") == 0) {
+				continue;
+			} else if (strcmp(name, DEFAULT_LOGIN) == 0) {
+				retval = genhomedircon_user_add(
+				    sh, default_login, name, sename, 1);
+			} else {
+				retval = genhomedircon_user_add(
+				    sh, login_list, name, sename, 0);
+			}
+		}
+
+		if (retval == -ENOENT) {
+			WARN(sh, "couldn't find login for %s", name);
+		} else if (retval < 0) {
+			goto clean;
+		}
+	}
+
+	retval = STATUS_SUCCESS;
+clean:
+	if (seusers) {
+		for (i = 0; i < nseusers; i++) {
+			semanage_seuser_free(seusers[i]);
+		}
+
+		free(seusers);
+	}
+
+	if (retval < 0) {
+		while (*login_list) {
+			*login_list = genhomedircon_user_free(*login_list);
+		}
+
+		if (*default_login) {
+			genhomedircon_user_free(*default_login);
+		}
+	}
+
+	return retval;
+}
+
+static int genhomedircon_get_ignore_list(semanage_list_t **ignore_list,
+					 char *ignoredirs)
+{
+	char *tok = strtok(ignoredirs, ";");
+	while (tok) {
+		if (semanage_list_push(ignore_list, tok)) {
+			return STATUS_ERR;
+		}
+
+		tok = strtok(NULL, ";");
+	}
+
+	return STATUS_SUCCESS;
+}
+
+static int genhomedircon_replace(struct replacement_pair *repl,
+				 const char *line, Ustr **out)
+{
+	Ustr *replacement = ustr_dup_cstr(line);
+
+	if (!replacement) {
+		return STATUS_ERR;
+	}
+
+	for (; repl->search_for != NULL && repl->replace_with != NULL; repl++) {
+		ustr_replace_cstr(&replacement, repl->search_for,
+				  repl->replace_with, 0);
+	}
+
+	if (ustr_enomem(replacement)) {
+		ustr_sc_free(&replacement);
+		return STATUS_ERR;
+	}
+
+	*out = replacement;
+	return STATUS_SUCCESS;
+}
+
+static int genhomedircon_write_root_contexts(FILE *out, const char *homedir,
+					     semanage_list_t *root_ctx_list)
+{
+	struct replacement_pair repl[] = {
+	    {.search_for = TEMPLATE_HOME_ROOT, .replace_with = homedir},
+	    {NULL, NULL}};
+
+	for (; root_ctx_list; root_ctx_list = root_ctx_list->next) {
+		Ustr *replacement = NULL;
+
+		if (genhomedircon_replace(repl, root_ctx_list->data,
+					  &replacement) < 0) {
+			return STATUS_ERR;
+		}
+
+		if (!ustr_io_putfileline(&replacement, out)) {
+			ustr_sc_free(&replacement);
+			return STATUS_ERR;
+		}
+
+		ustr_sc_free(&replacement);
+	}
+
+	return STATUS_SUCCESS;
+}
+
+static int genhomedircon_fix_context(struct selogin_list *user, Ustr **line,
+				     int fixrole)
+{
+	int retval = STATUS_ERR;
+
+	const char whitespace[] = " \t\n";
+	size_t off, len, pos;
+
+	/* check for trailing whitespace */
+	off = ustr_spn_chrs_rev(*line, 0, whitespace, strlen(whitespace));
+
+	/* find the length of the last field in line */
+	len = ustr_cspn_chrs_rev(*line, off, whitespace, strlen(whitespace));
+
+	if (len == 0) {
+		return STATUS_ERR;
+	}
+
+	context_t context = NULL;
+	Ustr* new_context_ustr = NULL;
+
+	pos = ustr_len(*line) - (len + off);
+	const char *old_context = ustr_cstr(*line) + pos;
+
+	if (strcmp(old_context, CONTEXT_NONE) == 0) {
+		retval = STATUS_SUCCESS;
+		goto done;
+	}
+
+	context = context_new(old_context);
+
+	if (context_user_set(context, user->sename) != 0 ||
+	    context_range_set(context, user->level) != 0) {
+		goto done;
+	}
+
+	if (fixrole && context_role_set(context, user->prefix) != 0) {
+		goto done;
+	}
+
+	if (!ustr_del_subustr(line, pos + 1, len)) {
+		goto done;
+	}
+
+	const char *new_context = context_str(context);
+	
+	if (!new_context) {
+		goto done;
+	}
+
+	new_context_ustr = ustr_dup_cstr(new_context);
+	if (!ustr_add(line, new_context_ustr)) {
+		goto done;
+	}
+
+	retval = STATUS_SUCCESS;
+done:
+	ustr_sc_free(&new_context_ustr);
+	context_free(context);
+
+	return retval;
+}
+
+static int genhomedircon_replace_and_fix_context(struct replacement_pair *repl,
+						 const char *line,
+						 struct selogin_list *login,
+						 int fixrole,
+						 Ustr **replacement)
+{
+	if (genhomedircon_replace(repl, line, replacement) < 0) {
+		return STATUS_ERR;
+	}
+
+	if (genhomedircon_fix_context(login, replacement, fixrole) < 0) {
+		return STATUS_ERR;
+	}
+
+	return STATUS_SUCCESS;
+}
+
+static int genhomedircon_write_homedir_contexts(
+    semanage_handle_t *sh, FILE *out, struct selogin_list *login,
+    const char *homedir, semanage_list_t *homedir_ctx_list)
+{
+	int fixrole = sh->conf->enable_genhomedircon_rbac;
+
+	const char *comment_uname = strcmp(login->name, FALLBACK_NAME) == 0
+					? DEFAULT_LOGIN
+					: login->name;
+
+	if (!fprintf(out, COMMENT_USER_HOME_CONTEXT, comment_uname)) {
+		return STATUS_ERR;
+	}
+
+	struct replacement_pair repl[] = {
+	    {.search_for = TEMPLATE_ROLE, .replace_with = login->prefix},
+	    {.search_for = TEMPLATE_HOME_DIR, .replace_with = homedir},
+	    {.search_for = NULL, .replace_with = NULL}};
+
+	for (; homedir_ctx_list; homedir_ctx_list = homedir_ctx_list->next) {
+		Ustr *replacement = NULL;
+
+		if (genhomedircon_replace_and_fix_context(
+			repl, homedir_ctx_list->data, login, fixrole,
+			&replacement) == STATUS_ERR) {
+			return STATUS_ERR;
+		}
+
+		if (!ustr_io_putfileline(&replacement, out)) {
+			ustr_sc_free(&replacement);
+			return STATUS_ERR;
+		}
+
+		ustr_sc_free(&replacement);
+	}
+
+	return 1;
+}
+
+static int genhomedircon_write_user_contexts(semanage_handle_t *sh, FILE *out,
+					     struct selogin_list *entry,
+					     semanage_list_t *user_ctx_list)
+{
+	int fixrole = sh->conf->enable_genhomedircon_rbac;
+
+	struct replacement_pair repl[] = {
+	    {.search_for = TEMPLATE_USERNAME, .replace_with = entry->name},
+	    {.search_for = TEMPLATE_USER, .replace_with = entry->name},
+	    {.search_for = TEMPLATE_USERID, .replace_with = entry->uid},
+	    {.search_for = TEMPLATE_ROLE, .replace_with = entry->prefix},
+	    {.search_for = NULL, .replace_with = NULL}};
+
+	for (; user_ctx_list; user_ctx_list = user_ctx_list->next) {
+		Ustr *replacement = NULL;
+
+		if (genhomedircon_replace_and_fix_context(
+			repl, user_ctx_list->data, entry, fixrole,
+			&replacement) == STATUS_ERR) {
+			return -1;
+		}
+
+		if (!ustr_io_putfileline(&replacement, out)) {
+			ustr_sc_free(&replacement);
+			return -1;
+		}
+
+		ustr_sc_free(&replacement);
+	}
+
+	return 1;
+}
+
+semanage_list_t *genhomedircon_read_lines(const char *path,
+					  int (*pred)(const char *))
 {
 	FILE *template_file = NULL;
 	semanage_list_t *template_data = NULL;
 
-	template_file = fopen(s->homedir_template_path, "r");
+	template_file = fopen(path, "r");
 	if (!template_file)
 		return NULL;
 	template_data = semanage_slurp_file_filter(template_file, pred);
@@ -508,637 +687,156 @@ static semanage_list_t *make_template(genhomedircon_settings_t * s,
 	return template_data;
 }
 
-static Ustr *replace_all(const char *str, const replacement_pair_t * repl)
+int semanage_genhomedircon(semanage_handle_t *sh, sepol_policydb_t *policydb,
+			   int usepasswd, char *ignoredirs)
 {
-	Ustr *retval = USTR_NULL;
-	int i;
+	(void) policydb;
+	int retval = STATUS_ERR;
 
-	if (!str || !repl)
-		goto done;
-	if (!(retval = ustr_dup_cstr(str)))
-		goto done;
-
-	for (i = 0; repl[i].search_for; i++) {
-		ustr_replace_cstr(&retval, repl[i].search_for,
-				  repl[i].replace_with, 0);
-	}
-	if (ustr_enomem(retval))
-		ustr_sc_free(&retval);
-
-      done:
-	return retval;
-}
-
-static const char * extract_context(Ustr *line)
-{
-	const char whitespace[] = " \t\n";
-	size_t off, len;
-
-	/* check for trailing whitespace */
-	off = ustr_spn_chrs_rev(line, 0, whitespace, strlen(whitespace));
-
-	/* find the length of the last field in line */
-	len = ustr_cspn_chrs_rev(line, off, whitespace, strlen(whitespace));
-
-	if (len == 0)
-		return NULL;
-	return ustr_cstr(line) + ustr_len(line) - (len + off);
-}
-
-static int check_line(genhomedircon_settings_t * s, Ustr *line)
-{
-	sepol_context_t *ctx_record = NULL;
-	const char *ctx_str;
-	int result;
-
-	ctx_str = extract_context(line);
-	if (!ctx_str)
-		return STATUS_ERR;
-
-	result = sepol_context_from_string(s->h_semanage->sepolh,
-					   ctx_str, &ctx_record);
-	if (result == STATUS_SUCCESS && ctx_record != NULL) {
-		sepol_msg_set_callback(s->h_semanage->sepolh, NULL, NULL);
-		result = sepol_context_check(s->h_semanage->sepolh,
-					     s->policydb, ctx_record);
-		sepol_msg_set_callback(s->h_semanage->sepolh,
-				       semanage_msg_relay_handler, s->h_semanage);
-		sepol_context_free(ctx_record);
-	}
-	return result;
-}
-
-static int write_replacements(genhomedircon_settings_t * s, FILE * out,
-			      const semanage_list_t * tpl,
-			      const replacement_pair_t *repl)
-{
-	Ustr *line = USTR_NULL;
-
-	for (; tpl; tpl = tpl->next) {
-		line = replace_all(tpl->data, repl);
-		if (!line)
-			goto fail;
-		if (check_line(s, line) == STATUS_SUCCESS) {
-			if (!ustr_io_putfileline(&line, out))
-				goto fail;
-		}
-		ustr_sc_free(&line);
-	}
-	return STATUS_SUCCESS;
-
-      fail:
-	ustr_sc_free(&line);
-	return STATUS_ERR;
-}
-
-static int write_home_dir_context(genhomedircon_settings_t * s, FILE * out,
-				  semanage_list_t * tpl, const genhomedircon_user_entry_t *user)
-{
-	replacement_pair_t repl[] = {
-		{.search_for = TEMPLATE_SEUSER,.replace_with = user->sename},
-		{.search_for = TEMPLATE_HOME_DIR,.replace_with = user->home},
-		{.search_for = TEMPLATE_ROLE,.replace_with = user->prefix},
-		{.search_for = TEMPLATE_LEVEL,.replace_with = user->level},
-		{NULL, NULL}
-	};
-
-	if (strcmp(user->name, FALLBACK_NAME) == 0) {
-		if (fprintf(out, COMMENT_USER_HOME_CONTEXT, FALLBACK_SENAME) < 0)
-			return STATUS_ERR;
-	} else {
-		if (fprintf(out, COMMENT_USER_HOME_CONTEXT, user->name) < 0)
-			return STATUS_ERR;
-	}
-
-	return write_replacements(s, out, tpl, repl);
-}
-
-static int write_home_root_context(genhomedircon_settings_t * s, FILE * out,
-				   semanage_list_t * tpl, char *homedir)
-{
-	replacement_pair_t repl[] = {
-		{.search_for = TEMPLATE_HOME_ROOT,.replace_with = homedir},
-		{NULL, NULL}
-	};
-
-	return write_replacements(s, out, tpl, repl);
-}
-
-static int write_username_context(genhomedircon_settings_t * s, FILE * out,
-				  semanage_list_t * tpl,
-				  const genhomedircon_user_entry_t *user)
-{
-	replacement_pair_t repl[] = {
-		{.search_for = TEMPLATE_USERNAME,.replace_with = user->name},
-		{.search_for = TEMPLATE_USERID,.replace_with = user->uid},
-		{.search_for = TEMPLATE_ROLE,.replace_with = user->prefix},
-		{.search_for = TEMPLATE_SEUSER,.replace_with = user->sename},
-		{NULL, NULL}
-	};
-
-	return write_replacements(s, out, tpl, repl);
-}
-
-static int write_user_context(genhomedircon_settings_t * s, FILE * out,
-			      semanage_list_t * tpl, const genhomedircon_user_entry_t *user)
-{
-	replacement_pair_t repl[] = {
-		{.search_for = TEMPLATE_USER,.replace_with = user->name},
-		{.search_for = TEMPLATE_ROLE,.replace_with = user->prefix},
-		{.search_for = TEMPLATE_SEUSER,.replace_with = user->sename},
-		{NULL, NULL}
-	};
-
-	return write_replacements(s, out, tpl, repl);
-}
-
-static int user_sort_func(semanage_user_t ** arg1, semanage_user_t ** arg2)
-{
-	return strcmp(semanage_user_get_name(*arg1),
-		      semanage_user_get_name(*arg2));
-}
-
-static int name_user_cmp(char *key, semanage_user_t ** val)
-{
-	return strcmp(key, semanage_user_get_name(*val));
-}
-
-static int push_user_entry(genhomedircon_user_entry_t ** list, const char *n,
-			   const char *u, const char *g, const char *sen,
-			   const char *pre, const char *h, const char *l)
-{
-	genhomedircon_user_entry_t *temp = NULL;
-	char *name = NULL;
-	char *uid = NULL;
-	char *gid = NULL;
-	char *sename = NULL;
-	char *prefix = NULL;
-	char *home = NULL;
-	char *level = NULL;
-
-	temp = malloc(sizeof(genhomedircon_user_entry_t));
-	if (!temp)
-		goto cleanup;
-	name = strdup(n);
-	if (!name)
-		goto cleanup;
-	uid = strdup(u);
-	if (!uid)
-		goto cleanup;
-	gid = strdup(g);
-	if (!gid)
-		goto cleanup;
-	sename = strdup(sen);
-	if (!sename)
-		goto cleanup;
-	prefix = strdup(pre);
-	if (!prefix)
-		goto cleanup;
-	home = strdup(h);
-	if (!home)
-		goto cleanup;
-	level = strdup(l);
-	if (!level)
-		goto cleanup;
-
-	temp->name = name;
-	temp->uid = uid;
-	temp->gid = gid;
-	temp->sename = sename;
-	temp->prefix = prefix;
-	temp->home = home;
-	temp->level = level;
-	temp->next = (*list);
-	(*list) = temp;
-
-	return STATUS_SUCCESS;
-
-      cleanup:
-	free(name);
-	free(uid);
-	free(gid);
-	free(sename);
-	free(prefix);
-	free(home);
-	free(level);
-	free(temp);
-	return STATUS_ERR;
-}
-
-static void pop_user_entry(genhomedircon_user_entry_t ** list)
-{
-	genhomedircon_user_entry_t *temp;
-
-	if (!list || !(*list))
-		return;
-
-	temp = *list;
-	*list = temp->next;
-	free(temp->name);
-	free(temp->uid);
-	free(temp->gid);
-	free(temp->sename);
-	free(temp->prefix);
-	free(temp->home);
-	free(temp->level);
-	free(temp);
-}
-
-static int setup_fallback_user(genhomedircon_settings_t * s)
-{
-	semanage_seuser_t **seuser_list = NULL;
-	unsigned int nseusers = 0;
-	semanage_user_key_t *key = NULL;
-	semanage_user_t *u = NULL;
-	const char *name = NULL;
-	const char *seuname = NULL;
-	const char *prefix = NULL;
-	const char *level = NULL;
-	unsigned int i;
-	int retval;
-	int errors = 0;
-
-	retval = semanage_seuser_list(s->h_semanage, &seuser_list, &nseusers);
-	if (retval < 0 || (nseusers < 1)) {
-		/* if there are no users, this function can't do any other work */
-		return errors;
-	}
-
-	for (i = 0; i < nseusers; i++) {
-		name = semanage_seuser_get_name(seuser_list[i]);
-		if (strcmp(name, DEFAULT_LOGIN) == 0) {
-			seuname = semanage_seuser_get_sename(seuser_list[i]);
-
-			/* find the user structure given the name */
-			if (semanage_user_key_create(s->h_semanage, seuname,
-						     &key) < 0) {
-				errors = STATUS_ERR;
-				break;
-			}
-			if (semanage_user_query(s->h_semanage, key, &u) < 0)
-			{
-				prefix = name;
-				level = FALLBACK_LEVEL;
-			}
-			else
-			{
-				prefix = semanage_user_get_prefix(u);
-				level = semanage_user_get_mlslevel(u);
-				if (!level)
-					level = FALLBACK_LEVEL;
-			}
-
-			if (push_user_entry(&(s->fallback), FALLBACK_NAME,
-					    FALLBACK_UIDGID, FALLBACK_UIDGID,
-					    seuname, prefix, "", level) != 0)
-				errors = STATUS_ERR;
-			semanage_user_key_free(key);
-			if (u)
-				semanage_user_free(u);
-			break;
-		}
-	}
-
-	for (i = 0; i < nseusers; i++)
-		semanage_seuser_free(seuser_list[i]);
-	free(seuser_list);
-
-	return errors;
-}
-
-static genhomedircon_user_entry_t *get_users(genhomedircon_settings_t * s,
-					     int *errors)
-{
-	genhomedircon_user_entry_t *head = NULL;
-	semanage_seuser_t **seuser_list = NULL;
-	unsigned int nseusers = 0;
-	semanage_user_t **user_list = NULL;
-	unsigned int nusers = 0;
-	semanage_user_t **u = NULL;
-	const char *name = NULL;
-	const char *seuname = NULL;
-	const char *prefix = NULL;
-	const char *level = NULL;
-	char uid[11];
-	char gid[11];
-	struct passwd pwstorage, *pwent = NULL;
-	unsigned int i;
-	long rbuflen;
-	char *rbuf = NULL;
-	int retval;
-
-	*errors = 0;
-	retval = semanage_seuser_list(s->h_semanage, &seuser_list, &nseusers);
-	if (retval < 0 || (nseusers < 1)) {
-		/* if there are no users, this function can't do any other work */
-		return NULL;
-	}
-
-	if (semanage_user_list(s->h_semanage, &user_list, &nusers) < 0) {
-		nusers = 0;
-	}
-
-	qsort(user_list, nusers, sizeof(semanage_user_t *),
-	      (int (*)(const void *, const void *))&user_sort_func);
-
-	/* Allocate space for the getpwnam_r buffer */
-	rbuflen = sysconf(_SC_GETPW_R_SIZE_MAX);
-	if (rbuflen <= 0)
-		goto cleanup;
-	rbuf = malloc(rbuflen);
-	if (rbuf == NULL)
-		goto cleanup;
-
-	for (i = 0; i < nseusers; i++) {
-		seuname = semanage_seuser_get_sename(seuser_list[i]);
-		name = semanage_seuser_get_name(seuser_list[i]);
-
-		if (strcmp(name,"root") && strcmp(seuname, s->fallback->sename) == 0)
-			continue;
-
-		if (strcmp(name, DEFAULT_LOGIN) == 0)
-			continue;
-
-		if (strcmp(name, TEMPLATE_SEUSER) == 0)
-			continue;
-
-		/* %groupname syntax */
-		if (name[0] == '%')
-			continue;
-
-		/* find the user structure given the name */
-		u = bsearch(seuname, user_list, nusers, sizeof(semanage_user_t *),
-			    (int (*)(const void *, const void *))
-			    &name_user_cmp);
-		if (u) {
-			prefix = semanage_user_get_prefix(*u);
-			level = semanage_user_get_mlslevel(*u);
-			if (!level)
-				level = FALLBACK_LEVEL;
-		} else {
-			prefix = name;
-			level = FALLBACK_LEVEL;
-		}
-
-		retval = getpwnam_r(name, &pwstorage, rbuf, rbuflen, &pwent);
-		if (retval != 0 || pwent == NULL) {
-			if (retval != 0 && retval != ENOENT) {
-				*errors = STATUS_ERR;
-				goto cleanup;
-			}
-
-			WARN(s->h_semanage,
-			     "user %s not in password file", name);
-			continue;
-		}
-
-		int len = strlen(pwent->pw_dir) -1;
-		for(; len > 0 && pwent->pw_dir[len] == '/'; len--) {
-			pwent->pw_dir[len] = '\0';
-		}
-
-		if (strcmp(pwent->pw_dir, "/") == 0) {
-			/* don't relabel / genhomdircon checked to see if root
-			 * was the user and if so, set his home directory to
-			 * /root */
-			continue;
-		}
-		if (ignore(pwent->pw_dir))
-			continue;
-
-		len = snprintf(uid, sizeof(uid), "%u", pwent->pw_uid);
-		if (len < 0 || len >= (int)sizeof(uid)) {
-			*errors = STATUS_ERR;
-			goto cleanup;
-		}
-		len = snprintf(gid, sizeof(gid), "%u", pwent->pw_gid);
-		if (len < 0 || len >= (int)sizeof(gid)) {
-			*errors = STATUS_ERR;
-			goto cleanup;
-		}
-
-		if (push_user_entry(&head, name, uid, gid, seuname,
-				    prefix, pwent->pw_dir, level) != STATUS_SUCCESS) {
-			*errors = STATUS_ERR;
-			break;
-		}
-	}
-
-      cleanup:
-	free(rbuf);
-	if (*errors) {
-		for (; head; pop_user_entry(&head)) {
-			/* the pop function takes care of all the cleanup
-			   so the loop body is just empty */
-		}
-	}
-	for (i = 0; i < nseusers; i++) {
-		semanage_seuser_free(seuser_list[i]);
-	}
-	free(seuser_list);
-
-	for (i = 0; i < nusers; i++) {
-		semanage_user_free(user_list[i]);
-	}
-	free(user_list);
-
-	return head;
-}
-
-static int write_gen_home_dir_context(genhomedircon_settings_t * s, FILE * out,
-				      semanage_list_t * username_context_tpl,
-				      semanage_list_t * user_context_tpl,
-				      semanage_list_t * homedir_context_tpl)
-{
-	genhomedircon_user_entry_t *users;
-	int errors = 0;
-
-	users = get_users(s, &errors);
-	if (!users && errors) {
-		return STATUS_ERR;
-	}
-
-	for (; users; pop_user_entry(&users)) {
-		if (write_home_dir_context(s, out, homedir_context_tpl, users))
-			goto err;
-		if (write_username_context(s, out, username_context_tpl, users))
-			goto err;
-		if (write_user_context(s, out, user_context_tpl, users))
-			goto err;
-	}
-
-	return STATUS_SUCCESS;
-err:
-	for (; users; pop_user_entry(&users)) {
-	/* the pop function takes care of all the cleanup
-	 * so the loop body is just empty */
-	}
-
-	return STATUS_ERR;
-}
-
-/**
- * @param	s	settings structure, stores various paths etc. Must never be NULL
- * @param	out	the FILE to put all the output in.
- * @return	0 on success
- */
-static int write_context_file(genhomedircon_settings_t * s, FILE * out)
-{
-	semanage_list_t *homedirs = NULL;
-	semanage_list_t *h = NULL;
-	semanage_list_t *homedir_context_tpl = NULL;
-	semanage_list_t *homeroot_context_tpl = NULL;
-	semanage_list_t *username_context_tpl = NULL;
-	semanage_list_t *user_context_tpl = NULL;
-	int retval = STATUS_SUCCESS;
-
-	homedir_context_tpl = make_template(s, &HOME_DIR_PRED);
-	homeroot_context_tpl = make_template(s, &HOME_ROOT_PRED);
-	username_context_tpl = make_template(s, &USERNAME_CONTEXT_PRED);
-	user_context_tpl = make_template(s, &USER_CONTEXT_PRED);
-
-	if (!homedir_context_tpl
-	 && !homeroot_context_tpl
-	 && !username_context_tpl
-	 && !user_context_tpl)
-		goto done;
-
-	if (write_file_context_header(out) != STATUS_SUCCESS) {
-		retval = STATUS_ERR;
-		goto done;
-	}
-
-	if (setup_fallback_user(s) != 0) {
-		retval = STATUS_ERR;
-		goto done;
-	}
-
-	if (homedir_context_tpl || homeroot_context_tpl) {
-		homedirs = get_home_dirs(s);
-		if (!homedirs) {
-			WARN(s->h_semanage,
-			     "no home directories were available, exiting without writing");
-			goto done;
-		}
-
-		for (h = homedirs; h; h = h->next) {
-			Ustr *temp = ustr_dup_cstr(h->data);
-
-			if (!temp || !ustr_add_cstr(&temp, "/" FALLBACK_NAME)) {
-				ustr_sc_free(&temp);
-				retval = STATUS_ERR;
-				goto done;
-			}
-
-			free(s->fallback->home);
-			s->fallback->home = (char*) ustr_cstr(temp);
-
-			if (write_home_dir_context(s, out, homedir_context_tpl,
-						   s->fallback) != STATUS_SUCCESS) {
-				ustr_sc_free(&temp);
-				s->fallback->home = NULL;
-				retval = STATUS_ERR;
-				goto done;
-			}
-			if (write_home_root_context(s, out,
-						    homeroot_context_tpl,
-						    h->data) != STATUS_SUCCESS) {
-				ustr_sc_free(&temp);
-				s->fallback->home = NULL;
-				retval = STATUS_ERR;
-				goto done;
-			}
-
-			ustr_sc_free(&temp);
-			s->fallback->home = NULL;
-		}
-	}
-	if (user_context_tpl || username_context_tpl) {
-		if (write_username_context(s, out, username_context_tpl,
-					   s->fallback) != STATUS_SUCCESS) {
-			retval = STATUS_ERR;
-			goto done;
-		}
-
-		if (write_user_context(s, out, user_context_tpl,
-				       s->fallback) != STATUS_SUCCESS) {
-			retval = STATUS_ERR;
-			goto done;
-		}
-
-		if (write_gen_home_dir_context(s, out, username_context_tpl,
-					       user_context_tpl, homedir_context_tpl)
-				!= STATUS_SUCCESS) {
-			retval = STATUS_ERR;
-		}
-	}
-
-done:
-	/* Cleanup */
-	semanage_list_destroy(&homedirs);
-	semanage_list_destroy(&username_context_tpl);
-	semanage_list_destroy(&user_context_tpl);
-	semanage_list_destroy(&homedir_context_tpl);
-	semanage_list_destroy(&homeroot_context_tpl);
-
-	return retval;
-}
-
-int semanage_genhomedircon(semanage_handle_t * sh,
-			   sepol_policydb_t * policydb,
-			   int usepasswd, 
-			   char *ignoredirs)
-{
-	genhomedircon_settings_t s;
 	FILE *out = NULL;
-	int retval = 0;
+	struct selogin_list *login_list = NULL;
+	struct selogin_list *default_login = NULL;
+	semanage_list_t *ignore_list = NULL;
+	semanage_list_t *root_ctx_list = NULL;
+	semanage_list_t *user_ctx_list = NULL;
+	semanage_list_t *homedir_ctx_list = NULL;
 
-	assert(sh);
-
-	s.homedir_template_path =
-	    semanage_path(SEMANAGE_TMP, SEMANAGE_HOMEDIR_TMPL);
-	s.fcfilepath = semanage_final_path(SEMANAGE_FINAL_TMP,
-					   SEMANAGE_FC_HOMEDIRS);
-
-	s.fallback = calloc(1, sizeof(genhomedircon_user_entry_t));
-	if (s.fallback == NULL) {
-		retval = STATUS_ERR;
+	if (ignoredirs &&
+	    genhomedircon_get_ignore_list(&ignore_list, ignoredirs) ==
+		STATUS_ERR) {
+		ERR(sh, "Error encountered building ignore list");
 		goto done;
 	}
 
-	s.fallback->name = strdup(FALLBACK_NAME);
-	s.fallback->sename = strdup(FALLBACK_SENAME);
-	s.fallback->prefix = strdup(FALLBACK_PREFIX);
-	s.fallback->level = strdup(FALLBACK_LEVEL);
-	if (s.fallback->name == NULL
-	 || s.fallback->sename == NULL
-	 || s.fallback->prefix == NULL
-	 || s.fallback->level == NULL) {
-		retval = STATUS_ERR;
+	semanage_list_t *homedir_list = NULL;
+
+	if (genhomedircon_get_home_dirs(&homedir_list, usepasswd) ==
+	    STATUS_ERR) {
+		ERR(sh, "Unable to list home directories");
 		goto done;
 	}
 
-	if (ignoredirs) ignore_setup(ignoredirs);
+	if (genhomedircon_get_users(sh, &login_list, &default_login) ==
+	    STATUS_ERR) {
+		ERR(sh, "Could not get seuser login entries");
+		goto done;
+	}
 
-	s.usepasswd = usepasswd;
-	s.h_semanage = sh;
-	s.policydb = policydb;
+	if (default_login) {
+		default_login->name = FALLBACK_NAME;
+		default_login->uid = FALLBACK_UIDGID;
+		default_login->gid = FALLBACK_UIDGID;
+	} else {
+		WARN(sh, "No default seuser login found");
+	}
 
-	if (!(out = fopen(s.fcfilepath, "w"))) {
-		/* couldn't open output file */
+	const char *fc_path =
+	    semanage_final_path(SEMANAGE_FINAL_TMP, SEMANAGE_FC_HOMEDIRS);
+	out = fopen(fc_path, "w");
+
+	if (!out) {
 		ERR(sh, "Could not open the file_context file for writing");
-		retval = STATUS_ERR;
 		goto done;
 	}
 
-	retval = write_context_file(&s, out);
+	if (!fprintf(out, COMMENT_FILE_CONTEXT_HEADER)) {
+		ERR(sh, "Could not write to file_contexts file");
+		goto done;
+	}
 
+	const char *homedir_tmpl_path =
+	    semanage_path(SEMANAGE_TMP, SEMANAGE_HOMEDIR_TMPL);
+
+	homedir_ctx_list =
+	    genhomedircon_read_lines(homedir_tmpl_path, HOMEDIR_PRED);
+	user_ctx_list = genhomedircon_read_lines(homedir_tmpl_path, USER_PRED);
+	root_ctx_list = genhomedircon_read_lines(homedir_tmpl_path, ROOT_PRED);
+
+	if (default_login &&
+	    genhomedircon_write_user_contexts(sh, out, default_login,
+					      user_ctx_list) < 0) {
+		goto done;
+	}
+
+	semanage_list_t *homedir = homedir_list;
+
+	for (; homedir; homedir = homedir->next) {
+		if (semanage_list_find(ignore_list, homedir->data)) {
+			continue;
+		}
+
+		if (genhomedircon_write_root_contexts(out, homedir->data,
+						      root_ctx_list) < 0) {
+			ERR(sh, "Couldn't write HOMEROOT replacement contexts");
+			goto done;
+		}
+
+		if (!default_login) {
+			continue;
+		}
+
+		Ustr *fallback_homedir = ustr_dup_cstr(homedir->data);
+		if (!fallback_homedir ||
+		    !ustr_add_cstr(&fallback_homedir, "/" FALLBACK_NAME)) {
+			ustr_sc_free(&fallback_homedir);
+			goto done;
+		}
+
+		if (genhomedircon_write_homedir_contexts(
+			sh, out, default_login, ustr_cstr(fallback_homedir),
+			homedir_ctx_list) < 0) {
+			ustr_sc_free(&fallback_homedir);
+			goto done;
+		}
+
+		ustr_sc_free(&fallback_homedir);
+	}
+
+	struct selogin_list *seuser = login_list;
+	for (; seuser; seuser = seuser->next) {
+		if (semanage_list_find(ignore_list, seuser->homedir)) {
+			continue;
+		}
+
+		if (genhomedircon_write_user_contexts(sh, out, seuser,
+						      user_ctx_list) < 0) {
+			ERR(sh, "Couldn't write user contexts for %s",
+			    seuser->name);
+			goto done;
+		}
+
+		if (genhomedircon_write_homedir_contexts(
+			sh, out, seuser, seuser->homedir, homedir_ctx_list) < 0) {
+			ERR(sh, "Couldn't write homedir contexts for %s",
+			    seuser->name);
+			goto done;
+		}
+	}
+
+	retval = STATUS_SUCCESS;
 done:
-	if (out != NULL)
+	if (out != NULL) {
 		fclose(out);
+	}
 
-	pop_user_entry(&(s.fallback));
-	ignore_free();
+	if (default_login) {
+		// hack to prevent the FALLBACK_NAME and FALLBACK_UIDGID
+		// constants from being passed to free()
+		default_login->name = NULL;
+		default_login->uid = NULL;
+		default_login->gid = NULL;
+		genhomedircon_user_free(default_login);
+	}
+
+	while (login_list) {
+		login_list = genhomedircon_user_free(login_list);
+	}
+
+	semanage_list_destroy(&homedir_list);
+	semanage_list_destroy(&ignore_list);
+	semanage_list_destroy(&root_ctx_list);
+	semanage_list_destroy(&user_ctx_list);
+	semanage_list_destroy(&homedir_ctx_list);
 
 	return retval;
 }
