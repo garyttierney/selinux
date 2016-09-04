@@ -20,6 +20,7 @@
  *  02110-1301  USA
  */
 
+#include <selinux/context.h>
 #include <semanage/handle.h>
 #include <semanage/seusers_policy.h>
 #include <semanage/users_policy.h>
@@ -82,15 +83,14 @@
 #define TEMPLATE_USERNAME "%{USERNAME}"
 #define TEMPLATE_USERID "%{USERID}"
 
-#define TEMPLATE_SEUSER "system_u"
-#define TEMPLATE_LEVEL "s0"
-
 #define FALLBACK_SENAME "user_u"
 #define FALLBACK_PREFIX "user"
 #define FALLBACK_LEVEL "s0"
 #define FALLBACK_NAME "[^/]+"
 #define FALLBACK_UIDGID "[0-9]+"
 #define DEFAULT_LOGIN "__default__"
+
+#define CONTEXT_NONE "<<none>>"
 
 typedef struct user_entry {
 	char *name;
@@ -599,14 +599,72 @@ static int write_replacements(genhomedircon_settings_t * s, FILE * out,
 	return STATUS_ERR;
 }
 
+static int write_contexts(genhomedircon_settings_t *s, FILE *out,
+			  semanage_list_t *tpl, const replacement_pair_t *repl,
+			  const genhomedircon_user_entry_t *user)
+{
+	Ustr *line = USTR_NULL;
+	context_t context = NULL;
+
+	for (; tpl; tpl = tpl->next) {
+		line = replace_all(tpl->data, repl);
+		if (!line) {
+			goto fail;
+		}
+
+		const char *old_context_str = extract_context(line);
+		if (!old_context_str) {
+			goto fail;
+		}
+
+		if (strcmp(old_context_str, CONTEXT_NONE) == 0) {
+			if (check_line(s, line) &&
+			    !ustr_io_putfileline(&line, out)) {
+				goto fail;
+			}
+
+			continue;
+		}
+
+		context = context_new(old_context_str);
+		if (!context) {
+			goto fail;
+		}
+
+		if (context_user_set(context, user->sename) != 0 ||
+		    context_range_set(context, user->level) != 0) {
+			goto fail;
+		}
+
+		const char *new_context_str = context_str(context);
+		if (!ustr_replace_cstr(&line, old_context_str,
+				       new_context_str, 1)) {
+			goto fail;
+		}
+
+		if (check_line(s, line) == STATUS_SUCCESS) {
+			if (!ustr_io_putfileline(&line, out)) {
+				goto fail;
+			}
+		}
+
+		ustr_sc_free(&line);
+		context_free(context);
+	}
+
+	return STATUS_SUCCESS;
+fail:
+	ustr_sc_free(&line);
+	context_free(context);
+	return STATUS_ERR;
+}
+
 static int write_home_dir_context(genhomedircon_settings_t * s, FILE * out,
 				  semanage_list_t * tpl, const genhomedircon_user_entry_t *user)
 {
 	replacement_pair_t repl[] = {
-		{.search_for = TEMPLATE_SEUSER,.replace_with = user->sename},
 		{.search_for = TEMPLATE_HOME_DIR,.replace_with = user->home},
 		{.search_for = TEMPLATE_ROLE,.replace_with = user->prefix},
-		{.search_for = TEMPLATE_LEVEL,.replace_with = user->level},
 		{NULL, NULL}
 	};
 
@@ -618,7 +676,7 @@ static int write_home_dir_context(genhomedircon_settings_t * s, FILE * out,
 			return STATUS_ERR;
 	}
 
-	return write_replacements(s, out, tpl, repl);
+	return write_contexts(s, out, tpl, repl, user);
 }
 
 static int write_home_root_context(genhomedircon_settings_t * s, FILE * out,
@@ -640,11 +698,10 @@ static int write_username_context(genhomedircon_settings_t * s, FILE * out,
 		{.search_for = TEMPLATE_USERNAME,.replace_with = user->name},
 		{.search_for = TEMPLATE_USERID,.replace_with = user->uid},
 		{.search_for = TEMPLATE_ROLE,.replace_with = user->prefix},
-		{.search_for = TEMPLATE_SEUSER,.replace_with = user->sename},
 		{NULL, NULL}
 	};
 
-	return write_replacements(s, out, tpl, repl);
+	return write_contexts(s, out, tpl, repl, user);
 }
 
 static int write_user_context(genhomedircon_settings_t * s, FILE * out,
@@ -653,11 +710,10 @@ static int write_user_context(genhomedircon_settings_t * s, FILE * out,
 	replacement_pair_t repl[] = {
 		{.search_for = TEMPLATE_USER,.replace_with = user->name},
 		{.search_for = TEMPLATE_ROLE,.replace_with = user->prefix},
-		{.search_for = TEMPLATE_SEUSER,.replace_with = user->sename},
 		{NULL, NULL}
 	};
 
-	return write_replacements(s, out, tpl, repl);
+	return write_contexts(s, out, tpl, repl, user);
 }
 
 static int seuser_sort_func(const void *arg1, const void *arg2)
@@ -1072,9 +1128,6 @@ static genhomedircon_user_entry_t *get_users(genhomedircon_settings_t * s,
 		name = semanage_seuser_get_name(seuser_list[i]);
 
 		if (strcmp(name, DEFAULT_LOGIN) == 0)
-			continue;
-
-		if (strcmp(name, TEMPLATE_SEUSER) == 0)
 			continue;
 
 		/* find the user structure given the name */
