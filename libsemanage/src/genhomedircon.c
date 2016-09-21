@@ -604,7 +604,8 @@ static int write_contexts(genhomedircon_settings_t *s, FILE *out,
 			  const genhomedircon_user_entry_t *user)
 {
 	Ustr *line = USTR_NULL;
-	context_t context = NULL;
+	sepol_context_t *context = NULL;
+	char *new_context_str = NULL;
 
 	for (; tpl; tpl = tpl->next) {
 		line = replace_all(tpl->data, repl);
@@ -618,7 +619,7 @@ static int write_contexts(genhomedircon_settings_t *s, FILE *out,
 		}
 
 		if (strcmp(old_context_str, CONTEXT_NONE) == 0) {
-			if (check_line(s, line) &&
+			if (check_line(s, line) == STATUS_SUCCESS &&
 			    !ustr_io_putfileline(&line, out)) {
 				goto fail;
 			}
@@ -626,17 +627,23 @@ static int write_contexts(genhomedircon_settings_t *s, FILE *out,
 			continue;
 		}
 
-		context = context_new(old_context_str);
-		if (!context) {
+		sepol_handle_t *sepolh = s->h_semanage->sepolh;
+
+		if (sepol_context_from_string(sepolh, old_context_str,
+		            &context) < 0) {
 			goto fail;
 		}
 
-		if (context_user_set(context, user->sename) != 0 ||
-		    context_range_set(context, user->level) != 0) {
+		if (sepol_context_set_user(sepolh, context, user->sename) < 0 ||
+		    sepol_context_set_mls(sepolh, context, user->level) < 0) {
 			goto fail;
 		}
 
-		const char *new_context_str = context_str(context);
+		if (sepol_context_to_string(sepolh, context,
+			    &new_context_str) < 0) {
+			goto fail;
+		}
+
 		if (!ustr_replace_cstr(&line, old_context_str,
 				       new_context_str, 1)) {
 			goto fail;
@@ -649,13 +656,15 @@ static int write_contexts(genhomedircon_settings_t *s, FILE *out,
 		}
 
 		ustr_sc_free(&line);
-		context_free(context);
+		sepol_context_free(context);
+		free(new_context_str);
 	}
 
 	return STATUS_SUCCESS;
 fail:
 	ustr_sc_free(&line);
-	context_free(context);
+	sepol_context_free(context);
+	free(new_context_str);
 	return STATUS_ERR;
 }
 
