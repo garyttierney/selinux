@@ -19,6 +19,7 @@
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
+#include <sepol/policydb.h>
 #include <sepol/module.h>
 #include <sepol/handle.h>
 #include <sepol/cil/cil.h>
@@ -1291,6 +1292,10 @@ static int semanage_direct_commit(semanage_handle_t * sh)
 
 		retval = cil_build_policydb(cildb, &out);
 		if (retval < 0)
+			goto cleanup;
+
+		/* Index policydb for context validation */
+		if (sepol_policydb_index(sh->sepolh, out, 0))
 			goto cleanup;
 
 		/* File Contexts */
