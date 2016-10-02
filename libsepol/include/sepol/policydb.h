@@ -144,5 +144,13 @@ extern int sepol_policydb_mls_enabled(const sepol_policydb_t * p);
  */
 extern int sepol_policydb_compat_net(const sepol_policydb_t * p);
 
+/**
+ * Index the policydb and create caches for various structures
+ * used in context validation.
+ */
+extern int sepol_policydb_index(sepol_handle_t *handle,
+				sepol_policydb_t *p,
+				unsigned int verbose);
+
 __END_DECLS
 #endif

@@ -4017,6 +4017,21 @@ int policydb_reindex_users(policydb_t * p)
 	return 0;
 }
 
+int policydb_index(sepol_handle_t *handle, policydb_t *p,
+		   unsigned int verbose)
+{
+	if (policydb_index_decls(p))
+		return -1;
+
+	if (policydb_index_classes(p))
+		return -1;
+
+	if (policydb_index_others(handle, p, verbose))
+		return -1;
+
+	return 0;
+}
+
 void policy_file_init(policy_file_t *pf)
 {
 	memset(pf, 0, sizeof(policy_file_t));

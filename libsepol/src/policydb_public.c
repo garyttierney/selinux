@@ -208,3 +208,10 @@ int sepol_policydb_compat_net(const sepol_policydb_t * p)
 	return (hashtab_search(p->p.p_classes.table, PACKET_CLASS_NAME) ==
 		NULL);
 }
+
+int sepol_policydb_index(sepol_handle_t *handle,
+			 sepol_policydb_t *p,
+			 unsigned int verbose)
+{
+	return policydb_index(handle, &p->p, verbose);
+}

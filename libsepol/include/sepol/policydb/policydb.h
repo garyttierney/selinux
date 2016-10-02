@@ -608,6 +608,9 @@ extern int policydb_index_bools(policydb_t * p);
 extern int policydb_index_others(sepol_handle_t * handle, policydb_t * p,
 				 unsigned int verbose);
 
+extern int policydb_index(sepol_handle_t *handle, policydb_t *p,
+			  unsigned int verbose);
+
 extern int policydb_reindex_users(policydb_t * p);
 
 extern void policydb_destroy(policydb_t * p);
