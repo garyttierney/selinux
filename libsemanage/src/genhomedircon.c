@@ -638,7 +638,11 @@ static int write_contexts(genhomedircon_settings_t *s, FILE *out,
 			goto fail;
 		}
 
-		if (sepol_context_set_user(sepolh, context, user->sename) < 0 ||
+		if (sepol_context_set_user(sepolh, context, user->sename)) {
+			goto fail;
+		}
+
+		if (semanage_mls_enabled(s->h_semanage) &&
 		    sepol_context_set_mls(sepolh, context, user->level) < 0) {
 			goto fail;
 		}
