@@ -107,6 +107,10 @@ hidden_proto(selinux_trans_to_raw_context);
 hidden_proto(security_get_initial_context);
 hidden_proto(security_get_initial_context_raw);
 hidden_proto(selinux_reset_config);
+hidden_proto(security_context_to_sid);
+hidden_proto(security_context_to_sid_raw);
+hidden_proto(security_sid_to_context);
+hidden_proto(security_sid_to_context_raw);
 
 hidden void flush_class_cache(void);
 

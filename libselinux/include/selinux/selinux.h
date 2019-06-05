@@ -686,6 +686,24 @@ extern int selinux_lsetfilecon_default(const char *path);
  */
 extern void selinux_reset_config(void);
 
+/**
+ * Perform translation of a human-readable security context to the
+ * representation used by the kernel security server.
+ * Caller must free the resulting sid.
+ * Returns -1 upon error or 0 otherwise.
+ */
+extern int security_context_to_sid(const char *con, char **sid);
+extern int security_context_to_sid_raw(const char *con, char **sid);
+
+/**
+ * Perform translation of a kernel SID string to a human-readable
+ * security context.
+ * Caller must free the resulting context via freecon.
+ * Returns -1 upon error or 0 otherwise.
+ */
+extern int security_sid_to_context(const char *sid, char **con);
+extern int security_sid_to_context_raw(const char *sid, char **con);
+
 #ifdef __cplusplus
 }
 #endif
