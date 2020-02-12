@@ -974,6 +974,47 @@ exit:
 	return rc;
 }
 
+int cil_resolve_userfilerole(struct cil_tree_node *current, void *extra_args)
+{
+	struct cil_userfilerole *userfilerole = current->data;
+	struct cil_symtab_datum *user_datum = NULL;
+	struct cil_symtab_datum *role_datum = NULL;
+	struct cil_tree_node *user_node = NULL;
+	struct cil_tree_node *role_node = NULL;
+	int rc = SEPOL_ERR;
+
+	rc = cil_resolve_name(current, userfilerole->user_str, CIL_SYM_USERS, extra_args, &user_datum);
+	if (rc != SEPOL_OK) {
+		goto exit;
+	}
+
+	user_node = user_datum->nodes->head->data;
+
+	if (user_node->flavor != CIL_USER) {
+		cil_log(CIL_ERR, "Userfilerole must be a user: %s\n", user_datum->fqn);
+		rc = SEPOL_ERR;
+		goto exit;
+	}
+
+	rc = cil_resolve_name(current, userfilerole->role_str, CIL_SYM_ROLES, extra_args, &role_datum);
+	if (rc != SEPOL_OK) {
+		goto exit;
+	}
+
+	role_node = role_datum->nodes->head->data;
+
+	if (role_node->flavor != CIL_ROLE) {
+		cil_log(CIL_ERR, "Userfilerole must be a role: %s\n", role_datum->fqn);
+		rc = SEPOL_ERR;
+		goto exit;
+	}
+
+	userfilerole->user = (struct cil_user*)user_datum;
+	userfilerole->role = (struct cil_role*)role_datum;
+exit:
+	return rc;
+}
+
 int cil_resolve_selinuxuser(struct cil_tree_node *current, void *extra_args)
 {
 	struct cil_selinuxuser *selinuxuser = current->data;
@@ -3577,6 +3618,9 @@ int __cil_resolve_ast_node(struct cil_tree_node *node, void *extra_args)
 			break;
 		case CIL_USERPREFIX:
 			rc = cil_resolve_userprefix(node, args);
+			break;
+		case CIL_USERFILEROLE:
+			rc = cil_resolve_userfilerole(node, args);
 			break;
 		case CIL_SELINUXUSER:
 		case CIL_SELINUXUSERDEFAULT:

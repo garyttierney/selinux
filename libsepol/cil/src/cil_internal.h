@@ -172,6 +172,7 @@ extern char *CIL_KEY_USERLEVEL;
 extern char *CIL_KEY_USERRANGE;
 extern char *CIL_KEY_USERBOUNDS;
 extern char *CIL_KEY_USERPREFIX;
+extern char *CIL_KEY_USERFILEROLE;
 extern char *CIL_KEY_SELINUXUSER;
 extern char *CIL_KEY_SELINUXUSERDEFAULT;
 extern char *CIL_KEY_TYPEATTRIBUTE;
@@ -300,6 +301,7 @@ struct cil_db {
 	struct cil_sort *devicetreecon;
 	struct cil_sort *fsuse;
 	struct cil_list *userprefixes;
+	struct cil_list *userfileroles;
 	struct cil_list *selinuxusers;
 	struct cil_list *names;
 	int num_types_and_attrs;
@@ -481,6 +483,14 @@ struct cil_userprefix {
 	char *user_str;
 	struct cil_user *user;
 	char *prefix_str;
+	int enabled;
+};
+
+struct cil_userfilerole {
+	char *user_str;
+	struct cil_user *user;
+	char *role_str;
+	struct cil_role *role;
 };
 
 struct cil_selinuxuser {
@@ -1005,6 +1015,7 @@ void cil_sidcontext_init(struct cil_sidcontext **sidcontext);
 void cil_sidorder_init(struct cil_sidorder **sidorder);
 void cil_userrole_init(struct cil_userrole **userrole);
 void cil_userprefix_init(struct cil_userprefix **userprefix);
+void cil_userfilerole_init(struct cil_userfilerole **userfilerole);
 void cil_selinuxuser_init(struct cil_selinuxuser **selinuxuser);
 void cil_roleattribute_init(struct cil_roleattribute **attribute);
 void cil_roleattributeset_init(struct cil_roleattributeset **attrset);

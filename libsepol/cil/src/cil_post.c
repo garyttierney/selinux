@@ -699,6 +699,10 @@ static int __cil_post_db_array_helper(struct cil_tree_node *node, uint32_t *fini
 		cil_list_append(db->userprefixes, CIL_USERPREFIX, node->data);
 		break;
 	}
+	case CIL_USERFILEROLE: {
+		cil_list_append(db->userfileroles, CIL_USERFILEROLE, node->data);
+		break;
+	}
 	case CIL_SELINUXUSER: {
 		cil_list_prepend(db->selinuxusers, CIL_SELINUXUSER, node->data);
 		break;
@@ -1776,6 +1780,50 @@ exit:
 	return rc;
 }
 
+static int __cil_post_db_userfilerole_helper(struct cil_tree_node *node, uint32_t *finished, __attribute__((unused)) void *extra_args)
+{
+	int rc = SEPOL_ERR;
+	struct cil_block *blk = NULL;
+	struct cil_userfilerole *userfilerole = NULL;
+	struct cil_user *user = NULL;
+	struct cil_role *role = NULL;
+
+	switch (node->flavor) {
+	case CIL_BLOCK: {
+		blk = node->data;
+		if (blk->is_abstract == CIL_TRUE) {
+			*finished = CIL_TREE_SKIP_HEAD;
+		}
+		break;
+	}
+	case CIL_MACRO: {
+		*finished = CIL_TREE_SKIP_HEAD;
+		break;
+	}
+	case CIL_USERFILEROLE: {
+		userfilerole = node->data;
+		user = userfilerole->user;
+		role = userfilerole->role;
+
+		if (!ebitmap_get_bit(user->roles, role->value)) {
+			cil_log(CIL_INFO, "role %s is not associated with user %s\n",
+			        role->datum.fqn, user->datum.fqn);
+			rc = SEPOL_ERR;
+			goto exit;
+		}
+
+		break;
+	}
+	default:
+		break;
+	}
+
+	return SEPOL_OK;
+exit:
+	cil_log(CIL_INFO, "cil_post_db_userfilerole_helper failed\n");
+	return rc;
+}
+
 static int __evaluate_level_expression(struct cil_level *level, struct cil_db *db)
 {
 	if (level->cats != NULL) {
@@ -2340,6 +2388,12 @@ static int cil_post_db(struct cil_db *db)
 	rc = cil_tree_walk(db->ast->root, __cil_post_db_userrole_helper, NULL, NULL, db);
 	if (rc != SEPOL_OK) {
 		cil_log(CIL_INFO, "Failed during userrole association\n");
+		goto exit;
+	}
+
+	rc = cil_tree_walk(db->ast->root, __cil_post_db_userfilerole_helper, NULL, NULL, db);
+	if (rc != SEPOL_OK) {
+		cil_log(CIL_INFO, "Failed during userfilerole evaluation\n");
 		goto exit;
 	}
 

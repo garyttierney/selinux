@@ -175,6 +175,7 @@ char *CIL_KEY_USERLEVEL;
 char *CIL_KEY_USERRANGE;
 char *CIL_KEY_USERBOUNDS;
 char *CIL_KEY_USERPREFIX;
+char *CIL_KEY_USERFILEROLE;
 char *CIL_KEY_SELINUXUSER;
 char *CIL_KEY_SELINUXUSERDEFAULT;
 char *CIL_KEY_TYPEATTRIBUTE;
@@ -318,6 +319,7 @@ static void cil_init_keys(void)
 	CIL_KEY_USERRANGE = cil_strpool_add("userrange");
 	CIL_KEY_USERBOUNDS = cil_strpool_add("userbounds");
 	CIL_KEY_USERPREFIX = cil_strpool_add("userprefix");
+	CIL_KEY_USERFILEROLE = cil_strpool_add("userfilerole");
 	CIL_KEY_SELINUXUSER = cil_strpool_add("selinuxuser");
 	CIL_KEY_SELINUXUSERDEFAULT = cil_strpool_add("selinuxuserdefault");
 	CIL_KEY_TYPEATTRIBUTE = cil_strpool_add("typeattribute");
@@ -433,6 +435,7 @@ void cil_db_init(struct cil_db **db)
 	cil_sort_init(&(*db)->devicetreecon);
 	cil_sort_init(&(*db)->fsuse);
 	cil_list_init(&(*db)->userprefixes, CIL_LIST_ITEM);
+	cil_list_init(&(*db)->userfileroles, CIL_LIST_ITEM);
 	cil_list_init(&(*db)->selinuxusers, CIL_LIST_ITEM);
 	cil_list_init(&(*db)->names, CIL_LIST_ITEM);
 
@@ -486,6 +489,7 @@ void cil_db_destroy(struct cil_db **db)
 	cil_sort_destroy(&(*db)->devicetreecon);
 	cil_sort_destroy(&(*db)->fsuse);
 	cil_list_destroy(&(*db)->userprefixes, CIL_FALSE);
+	cil_list_destroy(&(*db)->userfileroles, CIL_FALSE);
 	cil_list_destroy(&(*db)->selinuxusers, CIL_FALSE);
 	cil_list_destroy(&(*db)->names, CIL_TRUE);
 
@@ -751,6 +755,8 @@ void cil_destroy_data(void **data, enum cil_flavor flavor)
 	case CIL_USERPREFIX:
 		cil_destroy_userprefix(*data);
 		break;
+	case CIL_USERFILEROLE:
+		cil_destroy_userfilerole(*data);
 	case CIL_USERROLE:
 		cil_destroy_userrole(*data);
 		break;
@@ -1137,6 +1143,8 @@ const char * cil_node_to_string(struct cil_tree_node *node)
 		return CIL_KEY_USERATTRIBUTESET;
 	case CIL_USERPREFIX:
 		return CIL_KEY_USERPREFIX;
+	case CIL_USERFILEROLE:
+		return CIL_KEY_USERFILEROLE;
 	case CIL_USERROLE:
 		return CIL_KEY_USERROLE;
 	case CIL_USERLEVEL:
@@ -1379,8 +1387,9 @@ int cil_userprefixes_to_string_nopdb(struct cil_db *db, char **out, size_t *size
 	char *str_tmp = NULL;
 	struct cil_list_item *curr;
 	struct cil_userprefix *userprefix = NULL;
+	struct cil_userfilerole *userfilerole = NULL;
 	struct cil_user *user = NULL;
-
+	struct cil_role *role = NULL;
 	*out = NULL;
 
 	if (db->userprefixes->head == NULL) {
@@ -1389,9 +1398,30 @@ int cil_userprefixes_to_string_nopdb(struct cil_db *db, char **out, size_t *size
 		goto exit;
 	}
 
+	cil_list_for_each(curr, db->userfileroles) {
+		userfilerole = curr->data;
+		user = userfilerole->user;
+		role = userfilerole->role;
+		str_len += strlen("user ") + strlen(user->datum.fqn) + strlen(" filerole ") + strlen(role->datum.fqn) + 2;
+
+		cil_list_for_each(curr, db->userprefixes) {
+			userprefix = curr->data;
+
+			if (userprefix->user->value == user->value) {
+				userprefix->enabled = 0;
+				break;
+			}
+		}
+	}
+
 	cil_list_for_each(curr, db->userprefixes) {
 		userprefix = curr->data;
 		user = userprefix->user;
+
+		if (!userprefix->enabled) {
+			continue;
+		}
+
 		str_len += strlen("user ") + strlen(user->datum.fqn) + strlen(" prefix ") + strlen(userprefix->prefix_str) + 2;
 	}
 
@@ -1400,9 +1430,24 @@ int cil_userprefixes_to_string_nopdb(struct cil_db *db, char **out, size_t *size
 	str_tmp = cil_malloc(str_len * sizeof(char));
 	*out = str_tmp;
 
+	cil_list_for_each(curr, db->userfileroles) {
+		userfilerole = curr->data;
+		user = userfilerole->user;
+		role = userfilerole->role;
+
+		buf_pos = snprintf(str_tmp, str_len, "user %s filerole %s;\n", user->datum.fqn,
+				   role->datum.fqn);
+		str_len -= buf_pos;
+		str_tmp += buf_pos;
+	}
+
 	cil_list_for_each(curr, db->userprefixes) {
 		userprefix = curr->data;
 		user = userprefix->user;
+
+		if (!userprefix->enabled) {
+			continue;
+		}
 
 		buf_pos = snprintf(str_tmp, str_len, "user %s prefix %s;\n", user->datum.fqn,
 									userprefix->prefix_str);
@@ -2177,6 +2222,17 @@ void cil_userprefix_init(struct cil_userprefix **userprefix)
 	(*userprefix)->user_str = NULL;
 	(*userprefix)->user = NULL;
 	(*userprefix)->prefix_str = NULL;
+	(*userprefix)->enabled = 1;
+}
+
+void cil_userfilerole_init(struct cil_userfilerole **userfilerole)
+{
+	*userfilerole = cil_malloc(sizeof(**userfilerole));
+
+	(*userfilerole)->user_str = NULL;
+	(*userfilerole)->user = NULL;
+	(*userfilerole)->role_str = NULL;
+	(*userfilerole)->role = NULL;
 }
 
 void cil_selinuxuser_init(struct cil_selinuxuser **selinuxuser)

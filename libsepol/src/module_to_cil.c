@@ -3172,6 +3172,7 @@ static int user_extra_to_cil(struct sepol_module_package *mod_pkg)
 	char *prefix_str = NULL;
 	char *eol = NULL;
 	char *tmp = NULL;
+	int legacy_prefix = 0;
 
 	if (userx_len == 0) {
 		return 0;
@@ -3198,14 +3199,19 @@ static int user_extra_to_cil(struct sepol_module_package *mod_pkg)
 
 		prefix_len = strlen(prefix);
 		eol = prefix + prefix_len - 1;
-		if (*eol != ';' || strcmp(user_str, "user") || strcmp(prefix_str, "prefix")) {
+		legacy_prefix = strcmp(prefix_str, "prefix") == 0;
+		if (*eol != ';' || strcmp(user_str, "user") || (!legacy_prefix && strcmp(prefix_str, "filerole"))) {
 			rc = -1;
 			log_err("Invalid user extra line: %s", line);
 			goto exit;
 		}
 		*eol = '\0';
 
-		cil_println(0, "(userprefix %s %s)", user, prefix);
+		if (legacy_prefix) {
+			cil_println(0, "(userprefix %s %s)", user, prefix);
+		} else {
+			cil_println(0, "(userfilerole %s %s)", user, prefix);
+		}
 		free(user);
 		free(prefix);
 		free(line);

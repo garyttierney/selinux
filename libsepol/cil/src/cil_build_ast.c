@@ -1551,6 +1551,52 @@ void cil_destroy_userprefix(struct cil_userprefix *userprefix)
 	free(userprefix);
 }
 
+int cil_gen_userfilerole(struct cil_db *db, struct cil_tree_node *parse_current, struct cil_tree_node *ast_node)
+{
+	enum cil_syntax syntax[] = {
+		CIL_SYN_STRING,
+		CIL_SYN_STRING,
+		CIL_SYN_STRING,
+		CIL_SYN_END
+	};
+
+	int syntax_len = sizeof(syntax)/sizeof(*syntax);
+	struct cil_userfilerole *userfilerole = NULL;
+	int rc = SEPOL_ERR;
+
+	if (db == NULL || parse_current == NULL || ast_node == NULL) {
+		goto exit;
+	}
+
+	rc = __cil_verify_syntax(parse_current, syntax, syntax_len);
+	if (rc != SEPOL_OK) {
+		goto exit;
+	}
+
+	cil_userfilerole_init(&userfilerole);
+
+	userfilerole->user_str = parse_current->next->data;
+	userfilerole->role_str = parse_current->next->next->data;
+
+	ast_node->data = userfilerole;
+	ast_node->flavor = CIL_USERFILEROLE;
+
+	return SEPOL_OK;
+exit:
+	cil_tree_log(parse_current, CIL_ERR, "Bad userfilerole declaration");
+	cil_destroy_userfilerole(userfilerole);
+	return rc;
+}
+
+void cil_destroy_userfilerole(struct cil_userfilerole *userfilerole)
+{
+	if (userfilerole == NULL) {
+		return;
+	}
+
+	free(userfilerole);
+}
+
 int cil_gen_selinuxuser(struct cil_db *db, struct cil_tree_node *parse_current, struct cil_tree_node *ast_node)
 {
 	enum cil_syntax syntax[] = {
@@ -6253,6 +6299,8 @@ int __cil_build_ast_node_helper(struct cil_tree_node *parse_current, uint32_t *f
 		rc = cil_gen_bounds(db, parse_current, ast_node, CIL_USER);
 	} else if (parse_current->data == CIL_KEY_USERPREFIX) {
 		rc = cil_gen_userprefix(db, parse_current, ast_node);
+	} else if (parse_current->data == CIL_KEY_USERFILEROLE) {
+		rc = cil_gen_userfilerole(db, parse_current, ast_node);
 	} else if (parse_current->data == CIL_KEY_SELINUXUSER) {
 		rc = cil_gen_selinuxuser(db, parse_current, ast_node);
 		*finished = CIL_TREE_SKIP_NEXT;

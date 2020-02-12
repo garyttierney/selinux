@@ -91,6 +91,8 @@ void cil_destroy_userrange(struct cil_userrange *userrange);
 int cil_gen_userbounds(struct cil_db *db, struct cil_tree_node *parse_current, struct cil_tree_node *ast_node);
 int cil_gen_userprefix(struct cil_db *db, struct cil_tree_node *parse_current, struct cil_tree_node *ast_node);
 void cil_destroy_userprefix(struct cil_userprefix *userprefix);
+int cil_gen_userfilerole(struct cil_db *db, struct cil_tree_node *parse_current, struct cil_tree_node *ast_node);
+void cil_destroy_userfilerole(struct cil_userfilerole *userfilerole);
 int cil_gen_selinuxuser(struct cil_db *db, struct cil_tree_node *parse_current, struct cil_tree_node *ast_node);
 int cil_gen_selinuxuserdefault(struct cil_db *db, struct cil_tree_node *parse_current, struct cil_tree_node *ast_node);
 void cil_destroy_selinuxuser(struct cil_selinuxuser *selinuxuser);
